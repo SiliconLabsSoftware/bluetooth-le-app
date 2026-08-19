@@ -1,0 +1,26 @@
+# Studio metadata
+bluetooth_le_app_demos.xml
+
+# Conan
+conanbuild*
+conanrun*
+deactivate_conan*
+
+# SLT
+pkg.lock
+user.slconf
+pkg.slconf
+
+# Metadata files created during packaging
+/metadata
+*_examples.json
+*_demos.json
+
+# Default output directory for slc project generation
+out
+demos
+
+# ESL AP Python wrappers
+example_host/bt_host_esl_ap/esl_lib_wrapper.py
+example_host/bt_host_esl_ap/esl_key_lib_wrapper.py
+example_host/bt_host_esl_ap/.venv
