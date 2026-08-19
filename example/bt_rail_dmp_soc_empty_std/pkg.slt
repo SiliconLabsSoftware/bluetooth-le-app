@@ -1,0 +1,4 @@
+version = "0"
+[dependency]
+bluetooth_le_middleware = {version = "~11.1", installer = "conan", prerelease = true}
+rail_sdk = {version = "~3.1", installer = "conan", prerelease = true}

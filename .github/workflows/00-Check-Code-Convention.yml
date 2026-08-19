@@ -1,0 +1,22 @@
+name: 00-Check-Code-Convention
+on:
+  pull_request:
+    branches:
+      - main
+      - release/**
+  workflow_dispatch:
+
+jobs:
+  job1:
+    name: Check coding convention
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check Code Convention
+        uses: SiliconLabsSoftware/devs-coding-convention-tool@master
+        with:
+          exclude-regex: bluetooth_le_app_templates.xml
+          codespell-ignore-words: unsecure
+          codespell-skip-paths: ""

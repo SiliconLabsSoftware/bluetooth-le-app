@@ -1,0 +1,319 @@
+name: Build Modified Projects
+# Build modified application example projects on every pull request.
+# Hardware mapping (board or part) is generated based on bluetooth_le_app_templates.xml.
+
+permissions:
+  contents: read
+on:
+  workflow_dispatch:
+    inputs:
+      all_projects:
+        description: Build all indexed projects
+        required: false
+        type: boolean
+        default: false
+      base_commit_sha:
+        description: Full 40-character base commit SHA for affected-only manual runs. Ignored when all_projects is true.
+        required: false
+        type: string
+  pull_request:
+    branches:
+      - main
+      - release/**
+env:
+  SLT_URL: "https://www.silabs.com/documents/public/software/slt-cli-1.2.2-linux-x64.zip"
+  SDK_VERSION: "2026.6.2"
+  ALL_PROJECTS: ${{ github.event.inputs.all_projects == 'true' }}
+  CONAN_ENGINE_PATH: ".silabs/slt/engines/conan/conan_engine"
+  CONAN_BIN_PATH: ".silabs/slt/engines/conan/conan/conan"
+  CONAN_HOME_PATH: ".silabs/slt/installs/conan"
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip jq python3-venv python3-yaml
+
+      - name: Download and install SLT CLI
+        run: |
+          set -euo pipefail
+          slt_url="${SLT_URL}"
+          slt_zip="slt-cli-linux-x64.zip"
+
+          curl --fail --show-error --silent --location \
+            --proto '=https' --tlsv1.2 \
+            --retry 3 --retry-delay 2 \
+            --output "${slt_zip}" "${slt_url}"
+
+          tmpdir="$(mktemp -d)"
+          unzip -q "${slt_zip}" -d "${tmpdir}"
+          slt_bin="$(find "${tmpdir}" -type f -name 'slt' | head -1)"
+          sudo mkdir -p /opt/slt
+          sudo mv "${slt_bin}" /opt/slt/slt
+          sudo chmod +x /opt/slt/slt
+          sudo ln -sf /opt/slt/slt /usr/local/bin/slt
+          rm -rf "${tmpdir}"
+          rm -f "${slt_zip}"
+
+      - name: Install Conan via SLT
+        run: |
+          set -euo pipefail
+
+          slt install conan
+
+          conan_engine_path="$HOME/${CONAN_ENGINE_PATH}"
+          conan_path="$HOME/${CONAN_BIN_PATH}"
+          install_path="$HOME/.local/bin"
+
+          mkdir -p "${install_path}"
+          ln -fs "${conan_engine_path}" "${install_path}/conan_engine"
+          ln -fs "${conan_path}" "${install_path}/conan"
+
+          echo "${install_path}" >> "${GITHUB_PATH}"
+          echo "CONAN_HOME=$HOME/${CONAN_HOME_PATH}" >> "${GITHUB_ENV}"
+
+          export PATH="${install_path}:${PATH}"
+          conan --version
+          conan_engine --version | head -n 1
+
+      - name: Configure Conan remotes
+        run: |
+          set -euo pipefail
+          conan remote list
+          if ! conan remote list | grep -q '^conan-silabs-prerelease:'; then
+            conan remote add conan-silabs-prerelease https://conan-prerelease.silabs.net
+          fi
+          conan remote list
+
+      - name: Install simplicity-sdk
+        run: |
+          set -euo pipefail
+          slt install "simplicity-sdk/${SDK_VERSION}" --no-lock
+
+      - name: Generate ESL library wrappers
+        working-directory: example_host/bt_host_esl_ap
+        run: |
+          set -euo pipefail
+          make
+
+      - name: Check for dirty repo
+        run: |
+          git status --short --untracked-files
+
+      - name: Detect affected projects
+        id: affected-projects
+        env:
+          BASE_COMMIT_SHA: ${{ github.event.inputs.base_commit_sha || '' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:${PATH}"
+
+          detect_args=(
+            --repo-root .
+            --github-output "${GITHUB_OUTPUT}"
+          )
+          if [[ "${ALL_PROJECTS}" == "true" ]]; then
+            echo "Project detection mode: all-projects"
+            detect_args+=(--all-projects)
+          else
+            echo "Project detection mode: affected-only"
+            if [[ -n "${BASE_COMMIT_SHA}" ]]; then
+              detect_args+=(--base-commit-sha "${BASE_COMMIT_SHA}")
+            fi
+          fi
+
+          python3 .github/scripts/detect_affected_projects.py "${detect_args[@]}"
+
+      - name: Print affected projects output
+        shell: bash
+        run: |
+          echo "Affected projects count: ${{ steps.affected-projects.outputs.affected_projects_count }}"
+          echo "Affected projects json: ${{ steps.affected-projects.outputs.affected_projects_json }}"
+          echo "Affected projects list:"
+          printf '%s\n' "${{ steps.affected-projects.outputs.affected_projects_list }}"
+
+      - name: Generate hardware mapping
+        id: hardware-mapping
+        if: ${{ steps.affected-projects.outputs.affected_projects_count > 0 }}
+        env:
+          AFFECTED_PROJECTS_JSON: ${{ steps.affected-projects.outputs.affected_projects_json }}
+        run: |
+          set -euo pipefail
+          templates_xml="${GITHUB_WORKSPACE}/bluetooth_le_app_templates.xml"
+          hardware_json="${RUNNER_TEMP}/project-hardware-list.json"
+          if [[ ! -f "${templates_xml}" ]]; then
+            echo "Missing templates file required for hardware mapping: ${templates_xml}" >&2
+            exit 1
+          fi
+          python3 .github/scripts/build_generator.py \
+            "${templates_xml}" \
+            --toolchain gcc \
+            --allow-hidden \
+            --output "${hardware_json}"
+          echo "Generated hardware mapping: ${hardware_json}"
+          echo "Project entries: $(jq '.projects | length' "${hardware_json}")"
+
+          host_affected="$(jq -r --argjson affected "${AFFECTED_PROJECTS_JSON}" '
+            .projects as $all
+            | [$affected[] | ($all[.] // {}) | .hardware // empty]
+            | any(. == "linux")
+          ' "${hardware_json}")"
+          echo "host_affected=${host_affected}"
+          echo "hardware_json_path=${hardware_json}" >> "${GITHUB_OUTPUT}"
+          echo "host_affected=${host_affected}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install host example dependencies
+        if: ${{ steps.hardware-mapping.outputs.host_affected == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkgconf \
+            libsqlite3-dev \
+            libssl-dev \
+            libcjson-dev \
+            libmosquitto-dev \
+            libstdc++6 \
+            g++
+
+      - name: Build CPC daemon library
+        if: ${{ steps.hardware-mapping.outputs.host_affected == 'true' }}
+        run: |
+          git clone --depth 1 https://github.com/SiliconLabs/cpc-daemon.git /tmp/cpc-daemon
+          cd /tmp/cpc-daemon
+          mkdir build
+          cd build
+          cmake ../ -DENABLE_ENCRYPTION=FALSE
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
+
+      - name: Install build tools
+        if: ${{ steps.affected-projects.outputs.affected_projects_count > 0 }}
+        run: |
+          set -euo pipefail
+          slt install slc-cli commander --no-lock
+
+      - name: Configure SLC with SDK path
+        if: ${{ steps.affected-projects.outputs.affected_projects_count > 0 }}
+        run: |
+          sdk_path="$(slt where simplicity-sdk)"
+          slc_path="$(slt where slc-cli)"
+          java_path="$(slt where java21)/jre"
+          cmake_path="$(slt where cmake)"
+
+          echo "SDK_PATH=${sdk_path}"
+          echo "SLC_PATH=${slc_path}"
+          echo "JAVA_PATH=${java_path}"
+          echo "CMAKE_PATH=${cmake_path}"
+
+          export PATH="${slc_path}:${java_path}/bin:${PATH}"
+          echo "PATH=${PATH}" >> "${GITHUB_ENV}"
+          export JAVA_HOME="${java_path}"
+          echo "JAVA_HOME=${JAVA_HOME}" >> "${GITHUB_ENV}"
+
+          if [[ -x "${cmake_path}" && ! -d "${cmake_path}" ]]; then
+            cmake_bin_dir="$(dirname "${cmake_path}")"
+          elif [[ -x "${cmake_path}/bin/cmake" ]]; then
+            cmake_bin_dir="${cmake_path}/bin"
+          elif [[ -d "${cmake_path}" ]]; then
+            cmake_bin_dir="${cmake_path}"
+          else
+            echo "Unable to resolve cmake binary from path: ${cmake_path}" >&2
+            exit 1
+          fi
+
+          export PATH="${cmake_bin_dir}:${PATH}"
+          echo "PATH=${PATH}" >> "${GITHUB_ENV}"
+
+          java -version
+          cmake --version | head -n 1
+          slc signature trust --sdk "${sdk_path}"
+          slc configuration --sdk="${sdk_path}"
+
+      - name: Configure GCC toolchain
+        if: ${{ steps.affected-projects.outputs.affected_projects_count > 0 }}
+        run: |
+          gcc_path="$(slt where gcc-arm-none-eabi)"
+
+          echo "GCC_PATH=${gcc_path}"
+
+          export PATH="${gcc_path}/bin:${PATH}"
+          echo "PATH=${PATH}" >> "${GITHUB_ENV}"
+
+          slc configuration --gcc-toolchain="${gcc_path}"
+          slc configuration --examine
+
+      - name: Build projects
+        id: build-projects
+        if: ${{ steps.affected-projects.outputs.affected_projects_count > 0 }}
+        env:
+          AFFECTED_PROJECTS_JSON: ${{ steps.affected-projects.outputs.affected_projects_json }}
+          HARDWARE_JSON_PATH: ${{ steps.hardware-mapping.outputs.hardware_json_path }}
+        run: |
+          set -euo pipefail
+          echo "AFFECTED_PROJECTS_JSON=${AFFECTED_PROJECTS_JSON}"
+          echo "HARDWARE_JSON_PATH=${HARDWARE_JSON_PATH}"
+          python3 -u .github/scripts/build_projects.py \
+            --affected-projects-json "${AFFECTED_PROJECTS_JSON}" \
+            --all-projects "${ALL_PROJECTS}" \
+            --github-output "${GITHUB_OUTPUT}" \
+            --hardware-json "${HARDWARE_JSON_PATH}" \
+            --toolchain gcc
+
+      - name: No projects to build
+        if: ${{ steps.affected-projects.outputs.affected_projects_count == 0 }}
+        run: |
+          echo "No affected projects detected, skipping build"
+
+      - name: Aggregate all-projects build result
+        if: ${{ always() }}
+        env:
+          BUILDS_COUNT: ${{ steps.build-projects.outputs.builds_count || '0' }}
+          FAILURES_COUNT: ${{ steps.build-projects.outputs.failures_count || '0' }}
+          FAILURES_LIST: ${{ steps.build-projects.outputs.failures_list || '' }}
+          SUCCESSES_COUNT: ${{ steps.build-projects.outputs.successes_count || '0' }}
+          SUCCESSES_LIST: ${{ steps.build-projects.outputs.successes_list || '' }}
+        run: |
+          set -euo pipefail
+
+          builds_count="${BUILDS_COUNT}"
+          failures_count="${FAILURES_COUNT}"
+          successes_count="${SUCCESSES_COUNT}"
+
+          {
+            echo "## Build Summary"
+            echo
+            echo "- all_projects mode: ${ALL_PROJECTS}"
+            echo "- Total builds: ${builds_count}"
+            echo
+
+            echo "### Failed builds (${failures_count})"
+            if [[ -n "${FAILURES_LIST}" ]]; then
+              printf '%s\n' "${FAILURES_LIST}" | sed '/^$/d' | sed 's/^/- /'
+            else
+              echo "- none"
+            fi
+            echo
+
+            echo "### Successful builds (${successes_count})"
+            if [[ -n "${SUCCESSES_LIST}" ]]; then
+              printf '%s\n' "${SUCCESSES_LIST}" | sed '/^$/d' | sed 's/^/- /'
+            else
+              echo "- none"
+            fi
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${ALL_PROJECTS}" == "true" && "${failures_count}" -gt 0 ]]; then
+            echo "One or more projects failed in all-projects mode."
+            exit 1
+          fi

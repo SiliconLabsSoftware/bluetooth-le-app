@@ -1,0 +1,9 @@
+numpy
+pillow
+cryptography
+colorlog
+intelhex
+bincopy
+qrcode
+pyserial
+jsonschema
