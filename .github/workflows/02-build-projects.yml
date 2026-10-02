@@ -18,11 +18,11 @@ on:
         type: string
   pull_request:
     branches:
-      - main
+      - main*
       - release/**
 env:
   SLT_URL: "https://www.silabs.com/documents/public/software/slt-cli-1.2.2-linux-x64.zip"
-  SDK_VERSION: "2026.6.2"
+  SDK_VERSION: "2026.6.1"
   ALL_PROJECTS: ${{ github.event.inputs.all_projects == 'true' }}
   CONAN_ENGINE_PATH: ".silabs/slt/engines/conan/conan_engine"
   CONAN_BIN_PATH: ".silabs/slt/engines/conan/conan/conan"
